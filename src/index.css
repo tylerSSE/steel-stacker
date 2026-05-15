@@ -1,0 +1,22 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Global resets — minimal. The game owns its own background and typography
+   via inline styles and Tailwind classes. Body sets the default font so
+   anything that escapes a styled component still picks up Aleo. */
+html,
+body,
+#root {
+  min-height: 100vh;
+  background: #010715;
+  color: #cfe0ee;
+  font-family: "Aleo", Georgia, serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Prevent the page bouncing on iOS when you swipe in the playfield */
+body {
+  overscroll-behavior-y: none;
+}
