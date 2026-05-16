@@ -2140,7 +2140,11 @@ function Leaderboard({ entries, highlightId }) {
 function TurnstileWidget({ onToken, onExpire, onError }) {
   const containerRef = useRef(null);
   const widgetIdRef = useRef(null);
-  const siteKey = import.meta.env.VITE_TURNSTILE_SITE_KEY;
+  // Trim the site key defensively. Vercel env vars sometimes get saved with
+  // trailing whitespace or newlines from copy-paste, and Cloudflare rejects
+  // the render call with a cryptic "invalid sitekey" if the string contains
+  // anything but the exact key characters.
+  const siteKey = (import.meta.env.VITE_TURNSTILE_SITE_KEY || "").trim();
 
   useEffect(() => {
     console.log("[Turnstile] effect mount, siteKey present:", !!siteKey, "containerRef:", containerRef.current);
