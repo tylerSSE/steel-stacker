@@ -1,10 +1,10 @@
 // ============================================================================
 // POST /api/leaderboard/submit
 // ============================================================================
-// Accepts a submission, validates it server-side, hashes the requester IP,
-// and inserts into Supabase. The browser cannot insert directly (RLS blocks
-// it) — all writes funnel through here so we can enforce sanity checks and
-// rate limits without trusting client-side code.
+// Accepts a submission, validates it server-side, verifies the Cloudflare
+// Turnstile token, hashes the requester IP, and inserts into Supabase. The
+// browser cannot insert directly (RLS blocks it) — all writes funnel through
+// here so we can enforce sanity checks, bot challenges, and rate limits.
 //
 // Request body:
 //   {
@@ -14,27 +14,22 @@
 //     trucks_shipped: integer,
 //     courses_cleared: integer,
 //     game_duration_s: integer,
-//     turnstile_token: string (Stage 2b — added later)
+//     turnstile_token: string  <-- new in Stage 2b
 //   }
 //
 // Returns:
 //   200 { id: "..." } on success
 //   400 { error: "..." } on validation failure
+//   401 { error: "..." } on Turnstile verification failure
 //   429 { error: "..." } on rate limit
 //   500 { error: "..." } on server error
 // ============================================================================
 
 import crypto from "node:crypto";
 
-// In-memory rate limiter. Keyed by hashed IP. Survives only as long as this
-// serverless instance is warm (Vercel reuses instances for a few minutes).
-// For production scale, swap to Upstash Redis or a Supabase rate-limit table.
-// For our traffic volume this is more than adequate.
 const RATE_LIMIT_WINDOW_MS = 4 * 60 * 1000; // 4 minutes
 const submissionsByIp = new Map();
 
-// Same profanity list as the client. Server-authoritative — even if the
-// client check is bypassed, we re-validate here.
 const PROFANITY_LIST = [
   "fuck", "shit", "bitch", "cunt", "asshole", "dick", "cock", "pussy",
   "nigger", "nigga", "faggot", "retard", "whore", "slut", "bastard",
@@ -71,10 +66,6 @@ function sanitizeString(raw, { maxLength, required, fieldName }) {
 }
 
 function hashIp(ip) {
-  // Hash the IP with a salt so a database leak doesn't expose visitors.
-  // Salt comes from env var; if missing, fall back to a static string (still
-  // protects against trivial reverse lookups, just not against the database
-  // owner). Production should always set IP_HASH_SALT.
   const salt = process.env.IP_HASH_SALT || "sse-steel-stacker-default-salt";
   return crypto
     .createHash("sha256")
@@ -84,8 +75,6 @@ function hashIp(ip) {
 }
 
 function getClientIp(req) {
-  // Vercel sets x-forwarded-for with the real client IP at the leftmost slot.
-  // Fall back to req.socket if running locally.
   const fwd = req.headers["x-forwarded-for"];
   if (typeof fwd === "string" && fwd.length > 0) {
     return fwd.split(",")[0].trim();
@@ -94,6 +83,40 @@ function getClientIp(req) {
     return fwd[0].split(",")[0].trim();
   }
   return req.socket?.remoteAddress || "unknown";
+}
+
+// Verify a Turnstile token against Cloudflare. Returns { ok: true } if valid,
+// { ok: false, reason } if invalid. If the secret isn't configured (env var
+// missing), skip verification rather than blocking all submissions — lets the
+// site keep working if Cloudflare is misconfigured.
+async function verifyTurnstile(token, remoteIp) {
+  const secret = process.env.TURNSTILE_SECRET_KEY;
+  if (!secret) {
+    return { ok: true, skipped: true };
+  }
+  if (!token || typeof token !== "string") {
+    return { ok: false, reason: "Missing verification token" };
+  }
+  try {
+    const form = new URLSearchParams();
+    form.append("secret", secret);
+    form.append("response", token);
+    if (remoteIp) form.append("remoteip", remoteIp);
+
+    const cfResponse = await fetch(
+      "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+      { method: "POST", body: form },
+    );
+    const cfData = await cfResponse.json().catch(() => ({}));
+    if (cfData.success === true) return { ok: true };
+    return {
+      ok: false,
+      reason: "Verification failed",
+      codes: cfData["error-codes"],
+    };
+  } catch (e) {
+    return { ok: false, reason: "Could not verify request" };
+  }
 }
 
 export default async function handler(req, res) {
@@ -143,8 +166,6 @@ export default async function handler(req, res) {
   if (pounds_loaded < 0 || trucks_shipped < 0 || courses_cleared < 0 || game_duration_s < 0) {
     return res.status(400).json({ error: "Score fields cannot be negative" });
   }
-
-  // Sanity checks (mirror the client check, server-authoritative).
   if (game_duration_s < 60) {
     return res.status(400).json({ error: "Game was too short to submit" });
   }
@@ -157,8 +178,19 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "Truck count doesn't match tonnage" });
   }
 
-  // -- Rate limit --
+  // -- Get client IP --
   const clientIp = getClientIp(req);
+
+  // -- Verify Turnstile token (Stage 2b bot protection) --
+  // Runs BEFORE the rate limit so failed verifications don't burn the
+  // rate-limit slot. Returns 401 on failure so the client knows to refresh
+  // the widget and retry.
+  const tsResult = await verifyTurnstile(body.turnstile_token, clientIp);
+  if (!tsResult.ok) {
+    return res.status(401).json({ error: tsResult.reason || "Verification failed" });
+  }
+
+  // -- Rate limit --
   const ip_hash = hashIp(clientIp);
   const now = Date.now();
   const last = submissionsByIp.get(ip_hash);
@@ -197,20 +229,13 @@ export default async function handler(req, res) {
 
     if (!response.ok) {
       const text = await response.text();
-      // Common case: duplicate id (essentially impossible with our id format,
-      // but if it happened we'd return 500 and let the client retry).
       return res
         .status(500)
         .json({ error: "Database write failed", detail: text.slice(0, 200) });
     }
 
-    // Only record the rate-limit timestamp AFTER a successful insert. That
-    // way a failed submission (validation error, etc.) doesn't burn the
-    // 4-minute window.
     submissionsByIp.set(ip_hash, now);
 
-    // Light housekeeping: prune very old rate-limit map entries so memory
-    // doesn't grow forever on warm instances.
     if (submissionsByIp.size > 1000) {
       const cutoff = now - RATE_LIMIT_WINDOW_MS * 2;
       for (const [key, ts] of submissionsByIp.entries()) {
