@@ -2143,53 +2143,45 @@ function TurnstileWidget({ onToken, onExpire, onError }) {
   const siteKey = import.meta.env.VITE_TURNSTILE_SITE_KEY;
 
   useEffect(() => {
+    console.log("[Turnstile] effect mount, siteKey present:", !!siteKey, "containerRef:", containerRef.current);
     if (!siteKey) {
-      // No site key configured. Tell the parent we're "verified" with an
-      // empty token so the form doesn't block. Server will skip Turnstile
-      // verification if its secret is also unset.
+      console.log("[Turnstile] no site key, skipping");
       onToken && onToken("");
       return;
     }
 
     let cancelled = false;
 
-    // Load the Cloudflare Turnstile script if not already loaded. Idempotent —
-    // multiple components sharing the same script tag is fine.
-    //
-    // Race condition note: React StrictMode mounts effects twice. On the
-    // second mount, the script tag from the first mount may already exist,
-    // AND the load event may have already fired (so attaching a fresh load
-    // listener never resolves). To handle this we poll for window.turnstile
-    // up to 5 seconds, checking every 50ms. If the script is loaded and
-    // executed, the global appears within a frame or two.
     const ensureTurnstileReady = () => {
       return new Promise((resolve, reject) => {
-        // Fast path: already loaded and executed.
-        if (window.turnstile) return resolve();
-
-        // Make sure a script tag exists (create one if not).
+        if (window.turnstile) {
+          console.log("[Turnstile] global already present");
+          return resolve();
+        }
         const existing = document.querySelector(
           'script[src*="challenges.cloudflare.com/turnstile"]',
         );
         if (!existing) {
+          console.log("[Turnstile] injecting script tag");
           const script = document.createElement("script");
           script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
           script.async = true;
           script.defer = true;
           script.onerror = () => reject(new Error("Turnstile script load failed"));
           document.head.appendChild(script);
+        } else {
+          console.log("[Turnstile] script tag already exists");
         }
-
-        // Poll for window.turnstile. Cloudflare's script sets this global as
-        // soon as it executes. 50ms × 100 = 5 seconds before we give up.
         let attempts = 0;
         const maxAttempts = 100;
         const interval = setInterval(() => {
           attempts++;
           if (window.turnstile) {
+            console.log("[Turnstile] global ready after", attempts * 50, "ms");
             clearInterval(interval);
             resolve();
           } else if (attempts >= maxAttempts) {
+            console.log("[Turnstile] polling timeout");
             clearInterval(interval);
             reject(new Error("Turnstile script never initialized"));
           }
@@ -2199,26 +2191,48 @@ function TurnstileWidget({ onToken, onExpire, onError }) {
 
     ensureTurnstileReady()
       .then(() => {
-        if (cancelled || !containerRef.current || !window.turnstile) return;
+        console.log("[Turnstile] ready, cancelled:", cancelled, "container:", containerRef.current);
+        if (cancelled) return;
+        if (!containerRef.current) {
+          console.log("[Turnstile] container is null, bailing");
+          return;
+        }
+        if (!window.turnstile) {
+          console.log("[Turnstile] window.turnstile gone, bailing");
+          return;
+        }
         try {
+          console.log("[Turnstile] calling render with sitekey:", siteKey?.slice(0, 10) + "...");
           widgetIdRef.current = window.turnstile.render(containerRef.current, {
             sitekey: siteKey,
             theme: "dark",
-            callback: (token) => onToken && onToken(token),
-            "expired-callback": () => onExpire && onExpire(),
-            "error-callback": () => onError && onError(),
+            callback: (token) => {
+              console.log("[Turnstile] callback fired, token len:", token?.length);
+              onToken && onToken(token);
+            },
+            "expired-callback": () => {
+              console.log("[Turnstile] expired-callback fired");
+              onExpire && onExpire();
+            },
+            "error-callback": (code) => {
+              console.log("[Turnstile] error-callback fired with code:", code);
+              onError && onError();
+            },
           });
+          console.log("[Turnstile] render returned widget id:", widgetIdRef.current);
         } catch (e) {
+          console.log("[Turnstile] render threw:", e.message);
           onError && onError();
         }
       })
-      .catch(() => {
+      .catch((e) => {
+        console.log("[Turnstile] ensureTurnstileReady rejected:", e.message);
         onError && onError();
       });
 
     return () => {
+      console.log("[Turnstile] cleanup, widgetId:", widgetIdRef.current);
       cancelled = true;
-      // Best-effort widget cleanup on unmount so we don't leak DOM nodes.
       if (widgetIdRef.current != null && window.turnstile) {
         try {
           window.turnstile.remove(widgetIdRef.current);
@@ -2227,8 +2241,6 @@ function TurnstileWidget({ onToken, onExpire, onError }) {
         }
       }
     };
-    // siteKey is module-level constant; callbacks are stable enough that
-    // re-rendering would cause widget flicker. Mount-once is the right call.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
