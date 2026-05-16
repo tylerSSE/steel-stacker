@@ -1799,51 +1799,58 @@ function sanitizeInput(raw, { maxLength, required, fieldName }) {
   return { value: v, error: null };
 }
 
-// Leaderboard storage adapter. Stage 1 implementation uses localStorage —
-// per-browser, persists across sessions on the same device, NOT shared between
-// visitors. Stage 2 swaps this for fetch calls to /api/leaderboard/* routes
-// that talk to Supabase. The interface (getTop, submit) stays identical so the
-// swap is contained to this file.
+// Leaderboard storage adapter. Stage 2: real shared leaderboard via Vercel
+// serverless API routes that talk to Supabase Postgres. Browser never touches
+// the database directly — all writes flow through /api/leaderboard/submit
+// which validates server-side, hashes the IP, and inserts via the service
+// role key. Reads come from /api/leaderboard/top which caches at the edge.
 //
-// LIMITATION (Stage 1 only): Each visitor sees their own leaderboard. Two
-// people loading the site see two different boards. This is fine for testing
-// the UI and for individual play, but a shared leaderboard requires Stage 2.
-const LB_STORAGE_PREFIX = "sse-steel-stacker:lb:";
-
+// The interface (getTop, submit) is unchanged from Stage 1, so this swap is
+// contained to this file. The rest of the component keeps calling
+// leaderboardStorage.getTop(N) and leaderboardStorage.submit(entry).
 const leaderboardStorage = {
   async getTop(limit = 100) {
     try {
-      if (typeof window === "undefined" || !window.localStorage) return [];
-      const entries = [];
-      for (let i = 0; i < window.localStorage.length; i++) {
-        const key = window.localStorage.key(i);
-        if (!key || !key.startsWith(LB_STORAGE_PREFIX)) continue;
-        try {
-          const raw = window.localStorage.getItem(key);
-          if (raw) entries.push(JSON.parse(raw));
-        } catch (_) {
-          // Skip corrupt rows — Stage 2 server handles this properly.
-        }
+      const response = await fetch(`/api/leaderboard/top?limit=${limit}`, {
+        // The browser will cache via the Cache-Control header from the API
+        // route (30s edge cache). No need for explicit cache options here.
+        headers: { Accept: "application/json" },
+      });
+      if (!response.ok) {
+        // Server errors logged but not surfaced to the player — they see an
+        // empty leaderboard, which reads as "be the first" rather than
+        // "something's broken."
+        return [];
       }
-      entries.sort((a, b) => b.pounds_loaded - a.pounds_loaded);
-      return entries.slice(0, limit);
+      const data = await response.json();
+      return Array.isArray(data.entries) ? data.entries : [];
     } catch (e) {
       return [];
     }
   },
   async submit(entry) {
-    if (typeof window === "undefined" || !window.localStorage) {
-      return { success: false, error: "Storage unavailable in this environment" };
-    }
-    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const stored = { ...entry, id, created_at: new Date().toISOString() };
     try {
-      window.localStorage.setItem(`${LB_STORAGE_PREFIX}${id}`, JSON.stringify(stored));
-      return { success: true, id };
+      const response = await fetch("/api/leaderboard/submit", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify(entry),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        // Pass the server's error message through to the user — it's already
+        // sanitized and user-friendly (e.g. "Too many submissions, try again
+        // in 180s" or "Game was too short to submit").
+        return {
+          success: false,
+          error: data.error || `Submission failed (${response.status})`,
+        };
+      }
+      return { success: true, id: data.id };
     } catch (e) {
-      // localStorage can throw if quota is exceeded — extremely unlikely for
-      // small leaderboard entries but worth surfacing if it does.
-      return { success: false, error: "Could not save score" };
+      return { success: false, error: "Network error. Try again." };
     }
   },
 };
