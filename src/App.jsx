@@ -2155,37 +2155,62 @@ function TurnstileWidget({ onToken, onExpire, onError }) {
 
     // Load the Cloudflare Turnstile script if not already loaded. Idempotent —
     // multiple components sharing the same script tag is fine.
-    const ensureScript = () => {
+    //
+    // Race condition note: React StrictMode mounts effects twice. On the
+    // second mount, the script tag from the first mount may already exist,
+    // AND the load event may have already fired (so attaching a fresh load
+    // listener never resolves). To handle this we poll for window.turnstile
+    // up to 5 seconds, checking every 50ms. If the script is loaded and
+    // executed, the global appears within a frame or two.
+    const ensureTurnstileReady = () => {
       return new Promise((resolve, reject) => {
+        // Fast path: already loaded and executed.
         if (window.turnstile) return resolve();
+
+        // Make sure a script tag exists (create one if not).
         const existing = document.querySelector(
           'script[src*="challenges.cloudflare.com/turnstile"]',
         );
-        if (existing) {
-          existing.addEventListener("load", () => resolve(), { once: true });
-          existing.addEventListener("error", () => reject(new Error("Turnstile load failed")), { once: true });
-          return;
+        if (!existing) {
+          const script = document.createElement("script");
+          script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+          script.async = true;
+          script.defer = true;
+          script.onerror = () => reject(new Error("Turnstile script load failed"));
+          document.head.appendChild(script);
         }
-        const script = document.createElement("script");
-        script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
-        script.async = true;
-        script.defer = true;
-        script.onload = () => resolve();
-        script.onerror = () => reject(new Error("Turnstile load failed"));
-        document.head.appendChild(script);
+
+        // Poll for window.turnstile. Cloudflare's script sets this global as
+        // soon as it executes. 50ms × 100 = 5 seconds before we give up.
+        let attempts = 0;
+        const maxAttempts = 100;
+        const interval = setInterval(() => {
+          attempts++;
+          if (window.turnstile) {
+            clearInterval(interval);
+            resolve();
+          } else if (attempts >= maxAttempts) {
+            clearInterval(interval);
+            reject(new Error("Turnstile script never initialized"));
+          }
+        }, 50);
       });
     };
 
-    ensureScript()
+    ensureTurnstileReady()
       .then(() => {
         if (cancelled || !containerRef.current || !window.turnstile) return;
-        widgetIdRef.current = window.turnstile.render(containerRef.current, {
-          sitekey: siteKey,
-          theme: "dark",
-          callback: (token) => onToken && onToken(token),
-          "expired-callback": () => onExpire && onExpire(),
-          "error-callback": () => onError && onError(),
-        });
+        try {
+          widgetIdRef.current = window.turnstile.render(containerRef.current, {
+            sitekey: siteKey,
+            theme: "dark",
+            callback: (token) => onToken && onToken(token),
+            "expired-callback": () => onExpire && onExpire(),
+            "error-callback": () => onError && onError(),
+          });
+        } catch (e) {
+          onError && onError();
+        }
       })
       .catch(() => {
         onError && onError();
@@ -2874,6 +2899,19 @@ export default function SteelStackerGame() {
 
   useEffect(() => {
     const handler = (e) => {
+      // If the user is typing in an input field (the submit form's Operator
+      // or Company text inputs), ignore game keyboard shortcuts. Without this,
+      // pressing R or Enter while filling in the form would restart the game
+      // and wipe their submission progress. The form has its own submit
+      // mechanism via the Log Score button.
+      const tag = e.target?.tagName;
+      const isEditable =
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        tag === "SELECT" ||
+        e.target?.isContentEditable;
+      if (isEditable) return;
+
       if (screenRef.current === "title") {
         if (e.key === "Enter" || e.key === " ") startGame();
         return;
@@ -2915,8 +2953,11 @@ export default function SteelStackerGame() {
       }
     };
     // Re-arm soft drop on ArrowDown release. Lives in its own handler so
-    // keyup doesn't interfere with the keydown switch above.
+    // keyup doesn't interfere with the keydown switch above. Same input-aware
+    // guard as the keydown handler.
     const upHandler = (e) => {
+      const tag = e.target?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || e.target?.isContentEditable) return;
       if (e.key === "ArrowDown") softDropArmedRef.current = true;
     };
     window.addEventListener("keydown", handler);
