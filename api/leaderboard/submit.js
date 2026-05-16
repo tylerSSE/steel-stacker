@@ -90,7 +90,7 @@ function getClientIp(req) {
 // missing), skip verification rather than blocking all submissions — lets the
 // site keep working if Cloudflare is misconfigured.
 async function verifyTurnstile(token, remoteIp) {
-  const secret = process.env.TURNSTILE_SECRET_KEY;
+  const secret = (process.env.TURNSTILE_SECRET_KEY || "").trim();
   if (!secret) {
     return { ok: true, skipped: true };
   }
