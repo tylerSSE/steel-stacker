@@ -2123,6 +2123,109 @@ function Leaderboard({ entries, highlightId }) {
 // SUBMIT FORM
 // ============================================================================
 
+// Cloudflare Turnstile widget. Loads the script once at module level, then
+// each instance renders a widget in its container. When the user completes
+// the challenge (often invisibly — managed mode tries no-interaction first),
+// Cloudflare calls our callback with a token. The form then includes that
+// token in the submit POST, and the server verifies it before inserting.
+//
+// Props:
+//   onToken(token: string)  - called with the verification token on success
+//   onExpire()              - called when the token expires (>5 min idle)
+//   onError()               - called when the widget can't load or fails
+//
+// If VITE_TURNSTILE_SITE_KEY is unset (Stage 2a or local dev without keys),
+// the widget renders a small "verification disabled" notice and the form
+// auto-passes an empty token. Server-side falls back to skip mode.
+function TurnstileWidget({ onToken, onExpire, onError }) {
+  const containerRef = useRef(null);
+  const widgetIdRef = useRef(null);
+  const siteKey = import.meta.env.VITE_TURNSTILE_SITE_KEY;
+
+  useEffect(() => {
+    if (!siteKey) {
+      // No site key configured. Tell the parent we're "verified" with an
+      // empty token so the form doesn't block. Server will skip Turnstile
+      // verification if its secret is also unset.
+      onToken && onToken("");
+      return;
+    }
+
+    let cancelled = false;
+
+    // Load the Cloudflare Turnstile script if not already loaded. Idempotent —
+    // multiple components sharing the same script tag is fine.
+    const ensureScript = () => {
+      return new Promise((resolve, reject) => {
+        if (window.turnstile) return resolve();
+        const existing = document.querySelector(
+          'script[src*="challenges.cloudflare.com/turnstile"]',
+        );
+        if (existing) {
+          existing.addEventListener("load", () => resolve(), { once: true });
+          existing.addEventListener("error", () => reject(new Error("Turnstile load failed")), { once: true });
+          return;
+        }
+        const script = document.createElement("script");
+        script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+        script.async = true;
+        script.defer = true;
+        script.onload = () => resolve();
+        script.onerror = () => reject(new Error("Turnstile load failed"));
+        document.head.appendChild(script);
+      });
+    };
+
+    ensureScript()
+      .then(() => {
+        if (cancelled || !containerRef.current || !window.turnstile) return;
+        widgetIdRef.current = window.turnstile.render(containerRef.current, {
+          sitekey: siteKey,
+          theme: "dark",
+          callback: (token) => onToken && onToken(token),
+          "expired-callback": () => onExpire && onExpire(),
+          "error-callback": () => onError && onError(),
+        });
+      })
+      .catch(() => {
+        onError && onError();
+      });
+
+    return () => {
+      cancelled = true;
+      // Best-effort widget cleanup on unmount so we don't leak DOM nodes.
+      if (widgetIdRef.current != null && window.turnstile) {
+        try {
+          window.turnstile.remove(widgetIdRef.current);
+        } catch (_) {
+          // Ignore — widget already gone.
+        }
+      }
+    };
+    // siteKey is module-level constant; callbacks are stable enough that
+    // re-rendering would cause widget flicker. Mount-once is the right call.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  if (!siteKey) {
+    return (
+      <div
+        className="text-center py-2"
+        style={{
+          fontFamily: "'Bebas Neue', 'Oswald', sans-serif",
+          fontSize: 10,
+          letterSpacing: "0.22em",
+          color: "#4d7aa8",
+        }}
+      >
+        Verification Disabled · Development Mode
+      </div>
+    );
+  }
+
+  return <div ref={containerRef} className="flex justify-center" />;
+}
+
 function LeaderboardSubmitForm({
   poundsLoaded,
   trucksShipped,
@@ -2135,6 +2238,11 @@ function LeaderboardSubmitForm({
   const [company, setCompany] = useState("");
   // Honeypot field — bots fill it, humans don't. Hidden off-screen.
   const [website, setWebsite] = useState("");
+  // Cloudflare Turnstile verification token. Empty until the widget completes.
+  // If VITE_TURNSTILE_SITE_KEY is unset, the widget auto-resolves with "" so
+  // the form still works in development/Stage 2a mode.
+  const [turnstileToken, setTurnstileToken] = useState(null);
+  const [turnstileError, setTurnstileError] = useState(false);
   const [error, setError] = useState(null);
   const [submitting, setSubmitting] = useState(false);
   const [submitted, setSubmitted] = useState(false);
@@ -2170,6 +2278,14 @@ function LeaderboardSubmitForm({
       return;
     }
 
+    // Turnstile gate: must have a token before submitting. Null = widget still
+    // loading or hasn't completed. Empty string = verification disabled (no
+    // site key configured), which is allowed. Anything else = real token.
+    if (turnstileToken === null) {
+      setError("Verification in progress. Try again in a moment.");
+      return;
+    }
+
     setSubmitting(true);
     const result = await leaderboardStorage.submit({
       name: nameCheck.value.toUpperCase(),
@@ -2178,11 +2294,17 @@ function LeaderboardSubmitForm({
       trucks_shipped: trucksShipped,
       courses_cleared: coursesCleared,
       game_duration_s: gameDurationS,
+      turnstile_token: turnstileToken,
     });
     setSubmitting(false);
 
     if (!result.success) {
       setError(result.error || "Submission failed. Please try again.");
+      // If the server rejected our token (401), force the widget to reset
+      // so the user gets a fresh challenge on retry.
+      if (/verif/i.test(result.error || "")) {
+        setTurnstileToken(null);
+      }
       return;
     }
     setSubmitted(true);
@@ -2311,9 +2433,35 @@ function LeaderboardSubmitForm({
           </div>
         )}
 
-        {/* PRODUCTION NOTE: Cloudflare Turnstile widget mounts here when deployed.
-            The /api/leaderboard/submit endpoint verifies the token server-side
-            before accepting the entry. See DEPLOYMENT.md. */}
+        {/* Cloudflare Turnstile widget. Auto-completes invisibly for most
+            users in managed mode. Token is captured in state and passed in
+            the submit payload. Server-side verifies before insert. */}
+        <div className="pt-1">
+          <TurnstileWidget
+            onToken={(token) => {
+              setTurnstileToken(token);
+              setTurnstileError(false);
+            }}
+            onExpire={() => setTurnstileToken(null)}
+            onError={() => {
+              setTurnstileError(true);
+              setTurnstileToken("");
+            }}
+          />
+          {turnstileError && (
+            <div
+              className="text-center mt-1"
+              style={{
+                fontFamily: "'Aleo', Georgia, serif",
+                fontSize: 11,
+                fontStyle: "italic",
+                color: "#fca5a5",
+              }}
+            >
+              Verification widget failed to load. Submission may still work.
+            </div>
+          )}
+        </div>
 
         <div className="flex gap-2 pt-1">
           <button
