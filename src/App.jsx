@@ -2120,6 +2120,112 @@ function Leaderboard({ entries, highlightId }) {
 }
 
 // ============================================================================
+// LEADERBOARD MODAL
+// ============================================================================
+// Overlay modal that displays the top scores. Triggered from the title screen
+// so players can see what they're up against before starting a game. Lazy-
+// loads the leaderboard on open so we don't burn Supabase quota fetching for
+// every visitor regardless of intent.
+//
+// Props:
+//   open      - whether the modal is visible
+//   onClose() - called when the user dismisses (X button, backdrop, or Esc)
+
+function LeaderboardModal({ open, onClose }) {
+  const [entries, setEntries] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  // Fetch on open. We don't cache between opens — leaderboard may have changed
+  // since last view, and the fetch is cheap (edge-cached 30s server-side).
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setLoading(true);
+    leaderboardStorage.getTop(10).then((data) => {
+      if (cancelled) return;
+      setEntries(data || []);
+      setLoading(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
+
+  // Escape key closes the modal. Captured at window level so it works no
+  // matter where focus is.
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", handler, true); // capture phase so it beats the title-screen handler
+    return () => window.removeEventListener("keydown", handler, true);
+  }, [open, onClose]);
+
+  // Lock body scroll while the modal is open so the page behind doesn't move.
+  useEffect(() => {
+    if (!open) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = prev;
+    };
+  }, [open]);
+
+  if (!open) return null;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4 sm:p-8"
+      style={{ background: "rgba(2, 21, 48, 0.85)" }}
+      onClick={onClose}
+    >
+      <div
+        className="relative w-full max-w-2xl max-h-[90vh] overflow-y-auto"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {/* Close button — absolute positioned in the corner of the modal content */}
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Close leaderboard"
+          className="absolute top-3 right-3 z-10 w-9 h-9 flex items-center justify-center border bg-slate-900 hover:bg-slate-800 transition-colors"
+          style={{
+            borderColor: "#1668ab",
+            color: "#cfe0ee",
+            fontFamily: "'Bebas Neue', 'Oswald', sans-serif",
+            fontSize: 22,
+            lineHeight: 1,
+          }}
+        >
+          ×
+        </button>
+
+        {loading ? (
+          <div
+            className="border bg-slate-900/90 p-10 text-center"
+            style={{ borderColor: "#1668ab" }}
+          >
+            <div
+              className="uppercase tracking-[0.22em]"
+              style={{ fontFamily: "'Bebas Neue', 'Oswald', sans-serif", fontSize: 12, color: "#7eb0d6" }}
+            >
+              Loading the yard…
+            </div>
+          </div>
+        ) : (
+          <Leaderboard entries={entries} highlightId={null} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
 // SUBMIT FORM
 // ============================================================================
 
@@ -2664,6 +2770,14 @@ export default function SteelStackerGame() {
   const [leaderboardEntries, setLeaderboardEntries] = useState([]);
   const [submittedEntryId, setSubmittedEntryId] = useState(null);
   const [showSubmitForm, setShowSubmitForm] = useState(false);
+  // Title-screen leaderboard modal. Lets players preview the current top scores
+  // before starting a game — sets expectations early and encourages replay.
+  const [showLeaderboardModal, setShowLeaderboardModal] = useState(false);
+  // Ref so the keyboard handler can check modal state without re-binding.
+  const showLeaderboardModalRef = useRef(false);
+  useEffect(() => {
+    showLeaderboardModalRef.current = showLeaderboardModal;
+  }, [showLeaderboardModal]);
 
   // Responsive cell size — drives the playfield, crane, and trailer dimensions.
   // 24px on phones, 28px on desktop. Re-evaluated on viewport changes (rotation, resize).
@@ -2730,7 +2844,18 @@ export default function SteelStackerGame() {
     setHooked(true);
   }, [drawFromBag, poundsLoaded]);
 
+  // Guard for all gameplay actions: must be actively playing (not in title
+  // screen, game over, paused, or mid-dispatch). Read from refs so we don't
+  // need to re-add dependencies to every action callback. This prevents
+  // exploits like the mobile DROP button continuing to add tonnage after the
+  // game has ended.
+  const gameplayActive = () =>
+    screenRef.current === "playing" &&
+    !pausedRef.current &&
+    !shippingRef.current;
+
   const move = useCallback((dx, dy) => {
+    if (!gameplayActive()) return false;
     const p = pieceRef.current;
     if (!p) return false;
     if (!collides(gridRef.current, p, dx, dy)) {
@@ -2741,6 +2866,7 @@ export default function SteelStackerGame() {
   }, []);
 
   const tryRotate = useCallback(() => {
+    if (!gameplayActive()) return;
     const p = pieceRef.current;
     if (!p) return;
     const rotated = rotateMatrix(p.matrix);
@@ -2866,10 +2992,12 @@ export default function SteelStackerGame() {
   }, [spawnNext, startDispatchSequence]);
 
   const softDrop = useCallback(() => {
+    if (!gameplayActive()) return;
     if (!move(0, 1)) lockPiece();
   }, [move, lockPiece]);
 
   const hardDrop = useCallback(() => {
+    if (!gameplayActive()) return;
     const p = pieceRef.current;
     if (!p) return;
     let dy = 0;
@@ -2909,6 +3037,10 @@ export default function SteelStackerGame() {
       if (isEditable) return;
 
       if (screenRef.current === "title") {
+        // Don't start a game from keyboard while the leaderboard modal is open.
+        // The modal handles its own Escape key in capture phase, but Enter/Space
+        // would still trigger startGame without this guard.
+        if (showLeaderboardModalRef.current) return;
         if (e.key === "Enter" || e.key === " ") startGame();
         return;
       }
@@ -3178,6 +3310,28 @@ export default function SteelStackerGame() {
                 >
                   Hook the Crane →
                 </button>
+                {/* Inconspicuous leaderboard preview link. Small enough not to
+                    compete with the primary CTA, visible enough to signal
+                    "this is a leaderboard game" to anyone browsing. */}
+                <div className="mt-4">
+                  <button
+                    type="button"
+                    onClick={() => setShowLeaderboardModal(true)}
+                    className="uppercase transition-colors hover:text-amber-500"
+                    style={{
+                      fontFamily: "'Bebas Neue', 'Oswald', sans-serif",
+                      fontSize: 12,
+                      letterSpacing: "0.22em",
+                      color: "#4d7aa8",
+                      background: "transparent",
+                      border: "none",
+                      padding: 0,
+                      cursor: "pointer",
+                    }}
+                  >
+                    View Yard Leaderboard →
+                  </button>
+                </div>
               </div>
               <div className="md:col-span-3">
                 <div
@@ -3687,6 +3841,13 @@ export default function SteelStackerGame() {
           </div>
         </footer>
       </div>
+
+      {/* Title-screen leaderboard preview. Mounted at the top level so its
+          overlay covers the entire viewport including the footer. */}
+      <LeaderboardModal
+        open={showLeaderboardModal}
+        onClose={() => setShowLeaderboardModal(false)}
+      />
     </div>
   );
 }
