@@ -1455,6 +1455,7 @@ function ShippingTicket({
   startedAt,
   ticketNumber,
   onDispatch,
+  operatorName,
 }) {
   // Aggregate by designation: collapse L_R + L_L into one row, etc.
   // Order pieces by the order they appear in SHAPE_KEYS, so heaviest structurals
@@ -1586,7 +1587,7 @@ function ShippingTicket({
             >
               Driver:
             </span>
-            <span className="font-bold">CRANE OPERATOR</span>
+            <span className="font-bold">{operatorName || "CRANE OPERATOR"}</span>
           </div>
         </div>
 
@@ -1695,7 +1696,33 @@ function ShippingTicket({
         {/* Signature line + footer */}
         <div className="px-4 sm:px-6 py-3 border-t border-slate-300 flex justify-between items-end gap-4 flex-wrap">
           <div className="flex-1 min-w-[140px]">
-            <div className="border-b border-slate-900 h-6" />
+            {/* Signature SITS ON the line. Caveat cursive reads as a
+                handwritten yard-foreman scribble. Empty (just the line) when
+                the player hasn't submitted to the leaderboard yet. Slight
+                rotation and tucking below the baseline mimics a real signature
+                that doesn't sit perfectly on the ruled line. */}
+            <div className="border-b border-slate-900 h-7 flex items-end pl-2 pb-0">
+              {operatorName && (
+                <span
+                  style={{
+                    fontFamily: "'Caveat', 'Brush Script MT', cursive",
+                    fontSize: 28,
+                    fontWeight: 700,
+                    color: "#0f172a",
+                    lineHeight: 1,
+                    transform: "rotate(-2deg) translateY(2px)",
+                    transformOrigin: "left bottom",
+                    display: "inline-block",
+                  }}
+                >
+                  {/* Title case for signature feel — real signatures aren't
+                      all caps. Leaderboard and Driver: field stay uppercase. */}
+                  {operatorName
+                    .toLowerCase()
+                    .replace(/\b\w/g, (c) => c.toUpperCase())}
+                </span>
+              )}
+            </div>
             <div
               className="uppercase mt-1"
               style={{ fontFamily: "'Bebas Neue', 'Oswald', sans-serif", fontSize: 10, letterSpacing: "0.18em", color: "#1668ab" }}
@@ -2712,11 +2739,16 @@ export default function SteelStackerGame() {
           e.preventDefault(); move(1, 0); break;
         case "ArrowDown":
           e.preventDefault();
-          // Only soft-drop if armed. After a piece locks, the player must
-          // release ArrowDown and press it fresh before the next piece will
-          // soft-drop. Prevents accidental slam-through across pieces from
-          // a held key.
-          if (softDropArmedRef.current) softDrop();
+          // A fresh press (not OS auto-repeat) always works and re-arms.
+          // Auto-repeat events are gated by armed: holding through a piece
+          // lock disarms, so the next piece doesn't auto-soft-drop. Player
+          // must release and re-press to soft-drop the next piece.
+          if (!e.repeat) {
+            softDropArmedRef.current = true;
+            softDrop();
+          } else if (softDropArmedRef.current) {
+            softDrop();
+          }
           break;
         case "ArrowUp":
         case "x":
@@ -2775,6 +2807,13 @@ export default function SteelStackerGame() {
     setPiece(null);
     setScreen("playing");
     setTimeout(() => spawnNext(), 0);
+    // After game-over the page has grown long (shipping ticket, leaderboard,
+    // footer). On restart the playfield would otherwise be above the viewport
+    // and the page would be scrolled to the leaderboard. Reset to top so the
+    // playfield is in view and arrow keys land on gameplay, not page scroll.
+    if (typeof window !== "undefined") {
+      window.scrollTo(0, 0);
+    }
   };
 
   // Load leaderboard entries when the game ends. Re-fetched after a successful
@@ -2909,11 +2948,13 @@ export default function SteelStackerGame() {
                 </div>
                 <h2
                   className="font-black text-slate-100 mb-4 leading-tight"
-                  style={{ fontFamily: "'Aleo', Georgia, serif", fontSize: "clamp(36px, 5vw, 56px)" }}
+                  style={{
+                    fontFamily: "'Aleo', Georgia, serif",
+                    fontSize: "clamp(36px, 5vw, 56px)",
+                    textWrap: "balance",
+                  }}
                 >
-                  You're picking
-                  <br />
-                  the next load.
+                  You're picking the next load.
                 </h2>
                 <p className="text-slate-400 mb-4 leading-relaxed text-base sm:text-[17px]">
                   Wide flange, channel, plate, angle, hollow section, tee, even
@@ -2976,7 +3017,7 @@ export default function SteelStackerGame() {
                         {/* AISC designation in piece color, Aleo serif, 20px — primary content of the card */}
                         <div
                           className="font-black tracking-wider"
-                          style={{ color: s.color, fontFamily: "'Aleo', Georgia, serif", fontSize: 20 }}
+                          style={{ color: s.color, fontFamily: "'Aleo', Georgia, serif", fontSize: 18 }}
                         >
                           {s.designation}
                         </div>
@@ -3288,6 +3329,16 @@ export default function SteelStackerGame() {
                 startedAt={runStartedAt}
                 ticketNumber={ticketNumber}
                 onDispatch={startGame}
+                // Once the player submits to the leaderboard, retroactively
+                // stamp their name onto the ticket — driver signature line
+                // shows it in Aleo italic (signature feel) and the meta
+                // strip Driver: field shows it in caps. Falls back to the
+                // generic "CRANE OPERATOR" placeholder if not yet submitted.
+                operatorName={
+                  submittedEntryId
+                    ? leaderboardEntries.find((e) => e.id === submittedEntryId)?.name || null
+                    : null
+                }
               />
             </div>
 
